@@ -1,0 +1,12 @@
+setuptools
+click
+pyfiglet
+requests
+bs4
+beautifulsoup4
+eyed3
+tqdm
+Pillow
+ytmusicapi
+youtube_dl
+simple-chalk~=0.1.0
