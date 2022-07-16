@@ -1,15 +1,18 @@
-import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.request import urlopen
 from pathlib import Path
 import eyed3
-from tqdm.auto import tqdm
-from PIL import Image
 from ytmusicapi import YTMusic
 from youtube_dl import YoutubeDL
 import re
 import os
 from simple_chalk import chalk
-from .spotify_api import album, track, playlist
+from spotify_api import album, track, playlist
+from rich.progress import Progress
+from lyricsgenius import Genius
+import time
+
 
 def __convert_time_to_mills__(s: str) -> int:
     hours, minutes, seconds = (["0", "0"] + s.split(":"))[-3:]
@@ -47,18 +50,22 @@ def __identify_type__(url: str):
         return 'playlist'
 
 
-
-
 class ytmusic_tools(YTMusic):
 
     def __init__(self):
         super().__init__()
         self.bars = {}
+        self.bars_count = 0
+        self.lock = threading.Lock()
+        self.progress = Progress()  # type: Progress
+        self.progress.__enter__()
+        self.genius = Genius("w_iYnsU-rtqLy_fgQKKftC9huYvIT9x9TbXRpe2oVfr8TzCnbipUp7BTXGB16j3v")
+        self.failed = []
         # = Spotify(
-            #oauth_manager=SpotifyPKCE(client_id='0f3478f7324f489cb56d390d339fb5cb',
-                                      #redirect_uri='http://127.0.0.1:9090',
-                                      #scope='user-library-read'))
-        #self.genres = set(.recommendation_genre_seeds())
+        # oauth_manager=SpotifyPKCE(client_id='0f3478f7324f489cb56d390d339fb5cb',
+        # redirect_uri='http://127.0.0.1:9090',
+        # scope='user-library-read'))
+        # self.genres = set(.recommendation_genre_seeds())
 
     def __match_track_back_up__(self, track_data, search_term=None):
         if search_term is None:
@@ -74,8 +81,17 @@ class ytmusic_tools(YTMusic):
                             names += ', ' + artist['name']
                         else:
                             names += artist['name']
+                    lims = u"""la la la"""
+                    try:
+                        song = self.genius.search_song(track_data['name'], track_data['artists'][0]['name'])
+                        lyrics = str(song.lyrics)
+                        lims = lims.replace('la la la', re.sub("\[.*?]", "", lyrics))
+                    except Exception:
+                        print("Could not find lyrics for", track_data['name'])
+                        lims = lims.replace("la la la", "")
                     return {'id': result['videoId'], 'artwork': urlopen(track_data['album']['images'][0]['url']).read(),
-                            'title': track_data['name'], 'artists': names, 'album': track_data['album']['name']}
+                            'title': track_data['name'], 'artists': names, 'album': track_data['album']['name'],
+                            'lyrics': lims, 'track_num': -1}
 
     def match_track_with_spot_meta_data(self, track_data, search_term=None):
         if search_term is None:
@@ -85,54 +101,86 @@ class ytmusic_tools(YTMusic):
         if len(results) > 0:
             for result in results:
                 if abs(__convert_time_to_mills__(result['duration']) - track_data['duration_ms']) < 3000:
-                    dl = self.get_song(result['videoId'])
-                    URL = dl['thumbnail']['thumbnails'][-1]['url']
-                    temp = tempfile.NamedTemporaryFile(suffix=".jpg")
-                    img = Image.open(urlopen(URL)).convert('RGB')
-                    img.save(temp.name, 'jpeg')
-                    img.crop(
-                        (int((img.width - img.height) / 2), 0, img.height + (int((img.width - img.height) / 2)),
-                         img.height)).save(
-                        temp.name, quality=100)
-                    if result is not None and 'album' in result and result['album'] is not None:
-                        album = result['album']['name']
+                    ret_data = {}
+                    dl = self.get_song(result['videoId'])['videoDetails']
+                    if result is not None and 'album' in track_data and track_data['album'] is not None:
+                        album = track_data['album']['name']
+                        ret_data = {'id': result['videoId'],
+                                    'artwork': urlopen(track_data['album']['images'][0]['url']).read(),
+                                    'title': dl['title'],
+                                    'artists': dl['author'], 'album': album, 'lyrics': u"""la la la""",
+                                    "track_num": track_data['disc_number']}
                     else:
-                        album = dl['title']
-                    ret_data = {'id': result['videoId'], 'artwork': open(temp.name, 'rb').read(), 'title': dl['title'],
-                                'artists': ', '.join(dl['artists']), 'album': album}
-                    temp.close()
+                        bum = track(track_data['id'])['album']
+                        album = bum['name']
+                        ret_data = {'id': result['videoId'], 'artwork': urlopen(bum['images'][0]['url']).read(),
+                                    'title': dl['title'],
+                                    'artists': dl['author'], 'album': album, 'lyrics': u"""la la la""",
+                                    "track_num": track_data['disc_number']}
+                    try:
+                        song = self.genius.search_song(track_data['name'], track_data['artists'][0]['name'])
+                        lyrics = str(song.lyrics)
+                        ret_data['lyrics'] = ret_data['lyrics'].replace('la la la', re.sub("\[.*?]", "", lyrics))
+                    except Exception:
+                        ret_data['lyrics'] = ""
+                        print("Could not find lyrics for", track_data['name'])
                     return ret_data
 
         return self.__match_track_back_up__(track_data=track_data)
 
     def download(self, url):
         type = __identify_type__(url)
-        if type == 'album':
-            tracks = album(url)['tracks']['items']
-            for i in range(0, len(tracks)):
-                ttrack = tracks[i]
-                self.download_track(track_data=ttrack)
-        elif type == 'playlist':
-            tracks = playlist(url)['tracks']['items']
-            for i in range(0, len(tracks)):
-                ttrack = tracks[i]['track']
-                self.download_track(track_data=ttrack)
-        elif type == 'song':
-            self.download_track(track_data=track(url))
+        prat = ""
+        plim = None
+        with ThreadPoolExecutor(max_workers=500) as executor:
+            if type == 'album':
+                tracks = album(url)['tracks']['items']
+                for i in range(0, len(tracks)):
+                    ttrack = tracks[i]
+                    executor.submit(self.download_track, track_data=ttrack, executor=executor, track_num=i)
+                    time.sleep(3)
+            elif type == 'playlist':
+                plim = playlist(url)
+                tracks = plim['tracks']['items']
+                for i in range(0, len(tracks)):
+                    ttrack = tracks[i]['track']
+                    executor.submit(self.download_track, track_data=ttrack, executor=executor)
+                    time.sleep(3)
+            elif type == 'song':
+                executor.submit(self.download_track, track_data=track(url), executor=executor)
+            else:
+                results = self.search(url, filter='songs', limit=5)
+                print(url)
+                print(results)
+        if type == 'playlist':
+            lists = ""
+            for filename in os.listdir(prat):
+                f = os.path.join(prat, filename)
+                # checking if it is a file
+                if os.path.isfile(f):
+                    lists += "./" + filename + "\n"
+            with open(os.path.join(prat, plim['name'] + ".m3u"), "w") as file:
+                file.write(lists)
+        self.exit_handler()
 
-    def download_track(self, track_data):
+    def download_track(self, track_data, executor=None, track_num=0):
+        prat = os.path.join(str(Path.home()), "Music")
         try:
             meta_data = self.match_track_with_spot_meta_data(track_data)
             if meta_data is None:
                 meta_data = self.match_track_with_spot_meta_data(track_data,
-                                                                 search_term=__create_alternate_search_term__(track_data))
+                                                                 search_term=__create_alternate_search_term__(
+                                                                     track_data))
                 if meta_data is None:
                     print('unable to download song ' + track_data['name'])
                     return
             url = 'https://music.youtube.com/watch?v=' + meta_data['id']
+            path = Path(
+                os.path.join(prat, meta_data['artists'].replace('&', ',').split(', ')[0].strip(), meta_data['album']))
+            path.mkdir(parents=True, exist_ok=True)
             ydl_opts = {
                 'format': 'bestaudio/best',
-                'outtmpl': '~/Music/' + meta_data['title'] + '.%(ext)s',
+                'outtmpl': os.path.join(path, (meta_data['title'].replace('/', '_').replace('\\', '_') + ".%(ext)s")),
                 'progress_hooks': [self.my_hook],
                 'quiet': True,
                 'no_warnings': True,
@@ -145,34 +193,47 @@ class ytmusic_tools(YTMusic):
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
 
-            audiofile = eyed3.load(str(Path.home()) + '/Music/' + meta_data['title'] + '.mp3')
+            audiofile = eyed3.load(
+                os.path.join(path, (meta_data['title'].replace('/', '_').replace('\\', '_') + ".mp3")))
             if audiofile.tag is None:
                 audiofile.initTag()
             audiofile.tag.images.set(3, meta_data['artwork'], 'image/jpeg')
             audiofile.tag.title = meta_data['title']
-            audiofile.tag.artist = meta_data['artists']
+            audiofile.tag.artist = meta_data['artists'].replace('&', ',')
             audiofile.tag.album = meta_data['album']
-            #genres = .artist(track_data['artists'][0]['id'])['genres']
-            #gen = []
-            #for genre in genres:
-                #if self.genres.__contains__(genre.replace(' ', '-')):
-                    #gen.append(genre)
-            #audiofile.tag.genre = ', '.join(gen)
+            audiofile.tag.album_artist = meta_data['artists'].replace('&', ',').split(', ')[0].strip()
+            audiofile.tag.lyrics.set('\n'.join(meta_data['lyrics'].split('\n')[1:]))
+            if meta_data['track_num'] != -1:
+                audiofile.tag.track_num = meta_data['track_num']
+            else:
+                audiofile.tag.track_num = track_num
+            # genres = .artist(track_data['artists'][0]['id'])['genres']
+            # gen = []
+            # for genre in genres:
+            # if self.genres.__contains__(genre.replace(' ', '-')):
+            # gen.append(genre)
+            # audiofile.tag.genre = ', '.join(gen)
             audiofile.tag.save()
         except Exception:
-            print(chalk.red('error downloading a track'))
+            executor.submit(self.download_track, track_data=track_data, prat=prat, executor=executor)
+            print(chalk.red('error downloading track ' + track_data['name']))
+            self.failed.append(track_data)
 
     def my_hook(self, d):
-        filename = d['filename'] #type: str
+        filename = d['filename']  # type: str
         if d['status'] == 'finished':
-            self.bars[filename].close()
             file_tuple = os.path.split(os.path.abspath(d['filename']))
-            #print("Done downloading {}".format(file_tuple[1]))
-            print(chalk.green('converting to mp3... '))
+            self.progress.remove_task(self.bars[filename])
+            # print("Done downloading {}".format(file_tuple[1]))
+            # print(chalk.green('converting to mp3... '))
         if d['status'] == 'downloading':
             if filename not in self.bars:
-                self.bars[filename] = tqdm(total=100, unit='mb', desc=filename[filename.rindex('/')+1:filename.rindex('.')], bar_format=chalk.white("{l_bar}")+chalk.cyan("{bar}")+chalk.white("{r_bar}"))
+                self.bars[filename] = self.progress.add_task(
+                    "[red]" + filename[filename.rindex('/') + 1:filename.rindex('.')] + ": ", total=1000)
             p = d['_percent_str']
             p = p.replace('%', '')
-            self.bars[filename].n = float(p)  # check this
-            self.bars[filename].refresh()
+            self.progress.update(self.bars[filename], advance=float(p) * 10)
+
+    def exit_handler(self):
+        self.progress.__exit__(None, None, None)
+        print(chalk.green('exiting...'))

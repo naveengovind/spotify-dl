@@ -1,7 +1,8 @@
 from pyfiglet import Figlet
-from .ytmusic_tools import ytmusic_tools
+from ytmusic_tools import ytmusic_tools
 from simple_chalk import chalk
 import click
+
 
 @click.command()
 @click.option('--url', '-u', prompt='please enter a spotify url',
@@ -9,9 +10,9 @@ import click
 def main(url):
     ytmusic = ytmusic_tools()
     f = Figlet()
-    print(chalk.magentaBright(f.renderText('Spotify-DL')))
+    #print(chalk.magentaBright(f.renderText('Spotify-DL')))
     ytmusic.download(url)
-    print(chalk.magentaBright('finished!'))
+    #print(chalk.magentaBright('finished!'))
 
 
 if __name__ == '__main__':
